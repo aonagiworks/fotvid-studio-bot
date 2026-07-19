@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+models/colorization_release_v2.caffemodel
+.env
+.local/
