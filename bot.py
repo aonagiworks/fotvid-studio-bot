@@ -13,8 +13,9 @@ import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps
 from rembg import remove, new_session
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton)
 from telegram.constants import ChatMemberStatus
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -27,12 +28,20 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8978306167:AAG7lPvsQxOMwNFyj0erFO42SOCeWn3ylzo")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8978306167:***")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "6247336698"))
 FORCE_CHANNEL = os.environ.get("FORCE_CHANNEL", "botunlverse")
 CHANNEL_URL = f"https://t.me/{FORCE_CHANNEL}"
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "")
+REPLICATE_MODEL = os.environ.get("REPLICATE_MODEL", "piddnad/ddcolor")
 
 _SESSION = None
+_COLOR_NET = None
+_COLOR_PTS = None
+
+BASE_DIR = Path(__file__).resolve().parent
+DB_PATH = BASE_DIR / "data" / "users.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def get_session(model: str = "u2net"):
@@ -41,6 +50,71 @@ def get_session(model: str = "u2net"):
         _SESSION = new_session(model)
         _SESSION._model_name = model
     return _SESSION
+
+
+def _init_users_db():
+    import sqlite3
+    with sqlite3.connect(str(DB_PATH)) as c:
+        c.execute(
+            """CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                last_seen TEXT
+            )"""
+        )
+        c.commit()
+
+
+def track_user(user) -> None:
+    if not user:
+        return
+    import sqlite3
+    from datetime import datetime, timezone
+    _init_users_db()
+    with sqlite3.connect(str(DB_PATH)) as c:
+        c.execute(
+            """INSERT INTO users(user_id, username, first_name, last_seen)
+               VALUES(?,?,?,?)
+               ON CONFLICT(user_id) DO UPDATE SET
+                 username=excluded.username,
+                 first_name=excluded.first_name,
+                 last_seen=excluded.last_seen""",
+            (
+                user.id,
+                user.username or "",
+                user.first_name or "",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        c.commit()
+
+
+def all_user_ids() -> list[int]:
+    import sqlite3
+    _init_users_db()
+    with sqlite3.connect(str(DB_PATH)) as c:
+        rows = c.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()
+    return [int(r[0]) for r in rows]
+
+
+def get_color_net():
+    """Lazy-load Zhang colorization net once (slow cold start)."""
+    global _COLOR_NET, _COLOR_PTS
+    if _COLOR_NET is not None:
+        return _COLOR_NET
+    cfg = BASE_DIR / "models" / "colorization_deploy_v2.prototxt"
+    mdl = BASE_DIR / "models" / "colorization_release_v2.caffemodel"
+    pts_path = BASE_DIR / "models" / "pts_in_hull.npy"
+    net = cv2.dnn.readNetFromCaffe(str(cfg), str(mdl))
+    pts = np.load(str(pts_path))
+    pts = pts.transpose().reshape(2, 313, 1, 1)
+    net.getLayer(net.getLayerId("class8_ab")).blobs = [pts.astype(np.float32)]
+    net.getLayer(net.getLayerId("conv8_313_rh")).blobs = [np.full([1, 313], 2.606, np.float32)]
+    _COLOR_NET = net
+    _COLOR_PTS = pts
+    logger.info("Colorization model loaded")
+    return _COLOR_NET
 
 
 def main_kb() -> ReplyKeyboardMarkup:
@@ -139,7 +213,41 @@ async def require_sub(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> bool:
 # ── Processing ────────────────────────────────────────────────────────
 
 def rembg_bytes(data: bytes, model: str = "u2net") -> bytes:
-    return remove(data, session=get_session(model))
+    """Hapus background dengan post-process flux: alpha trim + anti-aliasing.
+    - Naikkan resolusi intermediate + mask refinement.
+    """
+    session = get_session(model)
+
+    # Upscale small images for better mask
+    img = Image.open(io.BytesIO(data)).convert("RGB")
+    w, h = img.size
+    target_min = 1024
+    if min(w, h) < target_min:
+        scale = target_min / min(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        data = buf.getvalue()
+
+    # Remove
+    out = remove(data, session=session)
+    out_img = Image.open(io.BytesIO(out)).convert("RGBA")
+
+    # Smooth mask (reduce hard edges)
+    alpha = out_img.split()[3]
+    # Blur mask slightly for softer edges
+    alpha = alpha.filter(ImageFilter.SMOOTH)
+    out_img.putalpha(alpha)
+
+    # Resize back if upscaled
+    if min(w, h) < target_min:
+        out_img = out_img.resize((w, h), Image.LANCZOS)
+
+    # Add alpha threshold to remove near-transparent bits
+    arr = np.array(out_img)
+    arr[arr[:, :, 3] < 15] = 0  # pure remove very low alpha
+
+    return pil_to_bytes(Image.fromarray(arr), "PNG")
 
 
 def pil_to_bytes(img: Image.Image, fmt: str = "PNG", quality: int = 95) -> bytes:
@@ -160,48 +268,171 @@ def composite_bg(fg_png: bytes, bg_bytes: bytes) -> bytes:
 
 
 def hd_upscale(img_bytes: bytes, scale: int = 4, denoise: bool = False) -> bytes:
-    """OpenCV Lanczos upscale (+ optional denoise)."""
-    arr = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-    h, w = arr.shape[:2]
-    # cap output to avoid OOM (max ~8MP-ish side)
+    """Multi-pass upscale: INTER_CUBIC steps + unsharp + optional denoise. Keeps RGB correct."""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w0, h0 = img.size
+    # Cap extreme upscale to keep quality/RAM sane
     max_side = 4096
-    new_w, new_h = w * scale, h * scale
-    if max(new_w, new_h) > max_side:
-        r = max_side / max(new_w, new_h)
-        new_w, new_h = int(new_w * r), int(new_h * r)
-    up = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
+    target_w, target_h = w0 * scale, h0 * scale
+    if max(target_w, target_h) > max_side:
+        r = max_side / max(target_w, target_h)
+        target_w, target_h = int(target_w * r), int(target_h * r)
+
+    arr = np.array(img)  # RGB
+    # multi-step 2x for better quality than one big jump
+    cur = arr
+    while cur.shape[1] * 2 <= target_w + 1 and cur.shape[0] * 2 <= target_h + 1 and (
+        cur.shape[0] < target_h or cur.shape[1] < target_w
+    ):
+        nh, nw = min(cur.shape[0] * 2, target_h), min(cur.shape[1] * 2, target_w)
+        cur = cv2.resize(cur, (nw, nh), interpolation=cv2.INTER_CUBIC)
+        # light unsharp each pass
+        blur = cv2.GaussianBlur(cur, (0, 0), 0.8)
+        cur = cv2.addWeighted(cur, 1.35, blur, -0.35, 0)
+
+    if cur.shape[1] != target_w or cur.shape[0] != target_h:
+        cur = cv2.resize(cur, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
     if denoise:
-        up = cv2.fastNlMeansDenoisingColored(up, None, 6, 6, 7, 21)
-    # slight sharpen
-    img = Image.fromarray(up)
-    img = ImageEnhance.Sharpness(img).enhance(1.25)
-    return pil_to_bytes(img, "JPEG", 92)
+        # OpenCV expects BGR for denoise colored
+        bgr = cv2.cvtColor(cur, cv2.COLOR_RGB2BGR)
+        bgr = cv2.fastNlMeansDenoisingColored(bgr, None, 3, 3, 7, 21)
+        cur = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # Final detail recovery
+    blur = cv2.GaussianBlur(cur, (0, 0), 1.0)
+    cur = cv2.addWeighted(cur, 1.45, blur, -0.45, 0)
+    pil = Image.fromarray(np.clip(cur, 0, 255).astype(np.uint8))
+    pil = ImageEnhance.Sharpness(pil).enhance(1.35)
+    pil = ImageEnhance.Contrast(pil).enhance(1.08)
+    pil = ImageEnhance.Color(pil).enhance(1.05)
+    return pil_to_bytes(pil, "JPEG", 96)
 
 
 def denoise_image(img_bytes: bytes) -> bytes:
     arr = np.array(Image.open(io.BytesIO(img_bytes)).convert("RGB"))
-    clean = cv2.fastNlMeansDenoisingColored(arr, None, 8, 8, 7, 21)
-    img = Image.fromarray(clean)
-    img = ImageEnhance.Sharpness(img).enhance(1.15)
-    return pil_to_bytes(img, "JPEG", 92)
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    clean = cv2.fastNlMeansDenoisingColored(bgr, None, 7, 7, 7, 21)
+    rgb = cv2.cvtColor(clean, cv2.COLOR_BGR2RGB)
+    img = Image.fromarray(rgb)
+    img = ImageEnhance.Sharpness(img).enhance(1.2)
+    return pil_to_bytes(img, "JPEG", 93)
 
 
 def colorize_image(img_bytes: bytes) -> bytes:
-    """True B&W → warna (Zhang colorization) + post-process biar lebih natural/vivid."""
-    cfg = Path(__file__).resolve().parent / "models" / "colorization_deploy_v2.prototxt"
-    mdl = Path(__file__).resolve().parent / "models" / "colorization_release_v2.caffemodel"
-    pts_path = Path(__file__).resolve().parent / "models" / "pts_in_hull.npy"
+    """True B&W → warna (Zhang) — default. Fallback jika Replicate tidak punya token."""
+    # Jika ada token Replicate, buka mode AI premium
+    if REPLICATE_API_TOKEN:
+        try:
+            return _replicate_colorize(img_bytes)
+        except Exception as e:
+            logger.warning(f"Replicate failed, fallback Zhang: {e}")
+    return _zhang_colorize(img_bytes)
 
-    net = cv2.dnn.readNetFromCaffe(str(cfg), str(mdl))
-    pts = np.load(str(pts_path))
-    pts = pts.transpose().reshape(2, 313, 1, 1)
-    net.getLayer(net.getLayerId("class8_ab")).blobs = [pts.astype(np.float32)]
-    net.getLayer(net.getLayerId("conv8_313_rh")).blobs = [np.full([1, 313], 2.606, np.float32)]
 
-    # Load & force grayscale L channel from true gray (better for B&W photos)
+def _replicate_colorize(img_bytes: bytes) -> bytes:
+    """Colorize via Replicate DDColor (piddnad/ddcolor)."""
+    import base64
+    import time
+
+    import httpx
+
+    if not REPLICATE_API_TOKEN:
+        raise RuntimeError("REPLICATE_API_TOKEN not set")
+
+    # Ensure JPEG-ish input for data URI
+    try:
+        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92)
+        img_bytes = buf.getvalue()
+    except Exception:
+        pass
+
+    b64 = base64.b64encode(img_bytes).decode()
+    data_uri = f"data:image/jpeg;base64,{b64}"
+    headers = {
+        "Authorization": f"Token {REPLICATE_API_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    logger.info("Calling Replicate DDColor (piddnad/ddcolor)...")
+    with httpx.Client(timeout=120.0) as client:
+        # Prefer model endpoint (always latest version)
+        resp = client.post(
+            f"https://api.replicate.com/v1/models/{REPLICATE_MODEL}/predictions",
+            headers={**headers, "Prefer": "wait"},
+            json={
+                "input": {
+                    "image": data_uri,
+                    "model_size": "large",
+                }
+            },
+        )
+        # Fallback if model endpoint not allowed
+        if resp.status_code in (404, 405):
+            resp = client.post(
+                "https://api.replicate.com/v1/predictions",
+                headers={**headers, "Prefer": "wait"},
+                json={
+                    "version": "ca494ba129e44e45f661d6ece83c4c98a9a7c774309beca01429b58fce8aa695",
+                    "input": {"image": data_uri, "model_size": "large"},
+                },
+            )
+
+        prediction = resp.json()
+        if resp.status_code not in (200, 201):
+            raise Exception(f"Replicate error {resp.status_code}: {prediction.get('detail', resp.text[:200])}")
+
+        def _extract_output(pred: dict) -> bytes | None:
+            out = pred.get("output")
+            if not out:
+                return None
+            if isinstance(out, list):
+                out = out[0]
+            if isinstance(out, str) and out.startswith("http"):
+                return client.get(out).content
+            if isinstance(out, str) and out.startswith("data:"):
+                # data:image/...;base64,...
+                try:
+                    return base64.b64decode(out.split(",", 1)[1])
+                except Exception:
+                    return None
+            return None
+
+        if prediction.get("status") == "succeeded":
+            data = _extract_output(prediction)
+            if data:
+                return data
+
+        get_url = (prediction.get("urls") or {}).get("get")
+        if not get_url:
+            raise Exception(f"Replicate unexpected response: {str(prediction)[:200]}")
+
+        for _ in range(40):
+            time.sleep(2)
+            poll = client.get(get_url, headers=headers).json()
+            st = poll.get("status")
+            if st == "succeeded":
+                data = _extract_output(poll)
+                if data:
+                    return data
+                raise Exception("Replicate succeeded but no image output")
+            if st == "failed":
+                raise Exception(f"Replicate failed: {poll.get('error', 'unknown')}")
+            if st == "canceled":
+                raise Exception("Replicate canceled")
+
+        raise Exception("Replicate timeout")
+
+
+
+def _zhang_colorize(img_bytes: bytes) -> bytes:
+    """True B&W → warna (Zhang) — model cached, better chroma + L-channel preserve."""
+    net = get_color_net()
+
     img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    # Downscale very large images for speed, upscale colors back
-    max_side = 1024
+    max_side = 768  # faster + often more stable colors
     w0, h0 = img.size
     scale = 1.0
     if max(w0, h0) > max_side:
@@ -210,43 +441,37 @@ def colorize_image(img_bytes: bytes) -> bytes:
     else:
         img_small = img
 
-    rgb = np.array(img_small).astype(np.float32) / 255.0
-    # Convert to gray then back to RGB so L is pure luminance
-    gray = cv2.cvtColor((rgb * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+    # Pure gray input (better for true B&W)
+    gray = np.array(img_small.convert("L"))
     rgb_gray = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB).astype(np.float32) / 255.0
     h, w = rgb_gray.shape[:2]
 
     lab = cv2.cvtColor(rgb_gray, cv2.COLOR_RGB2Lab)
     L = lab[:, :, 0]
-    L_rs = cv2.resize(L, (224, 224))
-    L_rs = L_rs - 50  # mean-center as in Zhang paper
-
-    net.setInput(cv2.dnn.blobFromImage(L_rs))
+    L_rs = cv2.resize(L, (224, 224)) - 50.0
+    net.setInput(cv2.dnn.blobFromImage(L_rs.astype(np.float32)))
     ab = net.forward()[0, :, :, :].transpose((1, 2, 0))
     ab = cv2.resize(ab, (w, h), interpolation=cv2.INTER_CUBIC)
 
-    # Boost chroma (Zhang tends to be desaturated)
-    ab = ab * 1.45
-    # Soft clip ab to realistic Lab range
-    ab = np.clip(ab, -110, 110)
+    # Mild chroma boost (too high looks fake)
+    ab = np.clip(ab * 1.25, -110, 110)
 
     lab_out = np.concatenate([L[:, :, np.newaxis], ab], axis=2)
     out = np.clip(cv2.cvtColor(lab_out.astype(np.float32), cv2.COLOR_Lab2RGB) * 255, 0, 255).astype(np.uint8)
 
-    # Upscale back to original if we downscaled
     if scale < 1.0:
         out = cv2.resize(out, (w0, h0), interpolation=cv2.INTER_LANCZOS4)
-        # Re-apply original luminance at full res for sharper detail
-        orig_gray = np.array(img.convert("L"), dtype=np.float32)
+        # Keep original full-res luminance for sharper detail
+        orig_L = np.array(img.convert("L"), dtype=np.float32) * (100.0 / 255.0)
         out_lab = cv2.cvtColor(out.astype(np.float32) / 255.0, cv2.COLOR_RGB2Lab)
-        out_lab[:, :, 0] = orig_gray * (100.0 / 255.0)
+        out_lab[:, :, 0] = orig_L
         out = np.clip(cv2.cvtColor(out_lab, cv2.COLOR_Lab2RGB) * 255, 0, 255).astype(np.uint8)
 
     pil = Image.fromarray(out)
-    pil = ImageEnhance.Color(pil).enhance(1.25)
-    pil = ImageEnhance.Contrast(pil).enhance(1.12)
-    pil = ImageEnhance.Sharpness(pil).enhance(1.2)
-    return pil_to_bytes(pil, "JPEG", 93)
+    pil = ImageEnhance.Color(pil).enhance(1.18)
+    pil = ImageEnhance.Contrast(pil).enhance(1.08)
+    pil = ImageEnhance.Sharpness(pil).enhance(1.15)
+    return pil_to_bytes(pil, "JPEG", 94)
 
 
 def make_video_note_from_image(img_bytes: bytes, duration: float = 3.0) -> bytes:
@@ -285,6 +510,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     uid = u.id
     username = u.username or "-"
     is_admin = uid == ADMIN_ID
+    track_user(u)
 
     # Check subscription automatically
     if not is_admin:
@@ -446,6 +672,31 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_help(update, ctx)
         return
 
+    if text.startswith("/broadcast") and update.effective_user.id == ADMIN_ID:
+        parts = text.split(maxsplit=1)
+        if len(parts) < 2:
+            await update.message.reply_text("❌ /broadcast <pesan>", reply_markup=main_kb())
+            return
+        msg = parts[1]
+        uids = all_user_ids()
+        ok = fail = 0
+        for uid in uids:
+            try:
+                await ctx.bot.send_message(uid, f"📢 *Broadcast*\n\n{msg}", parse_mode="Markdown")
+                ok += 1
+            except Exception:
+                fail += 1
+        await update.message.reply_text(f"📢 Broadcast: {ok} terkirim, {fail} gagal dari {len(uids)} user.", reply_markup=main_kb())
+        return
+
+    if text.startswith("/admin") and update.effective_user.id == ADMIN_ID:
+        uids = all_user_ids()
+        s = len(uids)
+        from datetime import datetime
+        j = datetime.now(timezone.utc).isoformat()
+        await update.message.reply_text(f"🛡️ *Admin Panel*\n👥 Total user: {s}\n/broadcast <pesan>\n📊 /stats", parse_mode="Markdown", reply_markup=main_kb())
+        return
+
     await update.message.reply_text("Pilih menu atau kirim foto.", reply_markup=main_kb())
 
 
@@ -570,6 +821,90 @@ async def on_video(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await wait.edit_text(f"❌ Gagal: {str(e)[:140]}")
 
 
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Admin panel — hanya untuk ADMIN_ID."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uids = all_user_ids()
+    s = len(uids)
+    await update.message.reply_text(
+        f"🛡️ *Admin Panel*\n👥 Total user: {s}\n/broadcast <pesan>\n/users — daftar user",
+        parse_mode="Markdown",
+        reply_markup=main_kb(),
+    )
+
+
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Daftar semua user (admin only)."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    uids = all_user_ids()
+    if not uids:
+        await update.message.reply_text("👥 Belum ada user.", reply_markup=main_kb())
+        return
+
+    # Build user list with details from DB
+    import sqlite3
+    from datetime import datetime
+    with sqlite3.connect(str(DB_PATH)) as c:
+        c.row_factory = sqlite3.Row
+        rows = c.execute(
+            "SELECT user_id, username, first_name, last_seen FROM users ORDER BY last_seen DESC"
+        ).fetchall()
+
+    lines = [f"👥 *Total: {len(uids)} user*\n"]
+    for r in rows[:50]:  # limit 50
+        name = r["first_name"] or "-"
+        uname = f"@{r['username']}" if r["username"] else "-"
+        ls = r["last_seen"][:19].replace("T", " ") if r["last_seen"] else "-"
+        lines.append(f"• `{r['user_id']}` | {uname} | {name} | {ls}")
+
+    if len(uids) > 50:
+        lines.append(f"\n... dan {len(uids) - 50} user lainnya")
+
+    text = "👥 *Daftar User*\n\n" + "\n".join(lines)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_kb())
+
+
+async def cmd_me(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Show own profile."""
+    if not await require_sub(update, ctx):
+        return
+    u = update.effective_user
+    await update.message.reply_text(
+        f"👤 *Profil Kamu*\n\n"
+        f"🆔 ID: `{u.id}`\n"
+        f"👤 Username: @{u.username or '-'}\n"
+        f"👤 Nama: {(u.first_name or '')+' '+(u.last_name or '')}".strip() or "-"
+        f"🌐 Lang: {u.language_code or '-'}\n"
+        f"🤖 Bot: {u.is_bot}",
+        parse_mode="Markdown",
+        reply_markup=main_kb(),
+    )
+
+
+async def cmd_broadcast(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Broadcast ke semua user — admin only."""
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if not ctx.args:
+        await update.message.reply_text("❌ /broadcast <pesan>", reply_markup=main_kb())
+        return
+    msg = " ".join(ctx.args)
+    uids = all_user_ids()
+    ok = fail = 0
+    for uid in uids:
+        try:
+            await ctx.bot.send_message(uid, f"📢 *Broadcast*\n\n{msg}", parse_mode="Markdown")
+            ok += 1
+        except Exception:
+            fail += 1
+    await update.message.reply_text(
+        f"📢 Broadcast: {ok} terkirim, {fail} gagal dari {len(uids)} user.",
+        reply_markup=main_kb(),
+    )
+
+
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE):
     logger.exception("Error: %s", ctx.error)
 
@@ -580,6 +915,11 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("me", cmd_me))
+    app.add_handler(CommandHandler("id", cmd_me))
+    app.add_handler(CommandHandler("admin", cmd_admin))
+    app.add_handler(CommandHandler("users", cmd_users))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.VIDEO | filters.VIDEO_NOTE, on_video))
